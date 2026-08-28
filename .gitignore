@@ -1,0 +1,17 @@
+# Staging directory for the published site, assembled by the build workflow
+# (and by the local commands in the README). Rebuilt every time, never committed.
+_site/
+
+# Guard against running the listing generator directly against the source tree
+# instead of a staging copy.
+assets/_v1/
+assets/*_thumbnails/
+
+# Created by `blender -c asset_listing download` when testing the library locally.
+_asset_download_location/
+
+# Editor/tooling state that sometimes lands inside the library folder.
+.claude/
+
+# Blender's automatic backup of the previous save.
+*.blend1

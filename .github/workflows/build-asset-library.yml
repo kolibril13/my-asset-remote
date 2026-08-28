@@ -1,0 +1,395 @@
+name: Build & Publish Remote Asset Library
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The asset library source: .blend files, blender_assets.cats.txt and
+  # _asset-library-meta.json. Never written to by the build.
+  LIBRARY_DIR: assets
+  # The published site root, assembled below.
+  SITE_DIR: _site
+  # Single source of truth for the installed Blender version — used for the
+  # setup-blender step and echoed into the generated landing page.
+  BLENDER_VERSION: "5.2"
+
+jobs:
+  build:
+    name: Generate asset listing
+    runs-on: ubuntu-latest
+
+    # Superseded runs for the same branch/PR are pointless, so drop them.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: BradyAJohnston/setup-blender@v5
+        with:
+          version: ${{ env.BLENDER_VERSION }}
+
+      # Blender and browsers read from the same root — <url>/_asset-library-meta.json
+      # and <url>/index.html — so the library is copied here and the landing page
+      # is written alongside it. Staging also keeps $LIBRARY_DIR pristine: the
+      # generator rewrites the metadata file in place and drops generated
+      # directories beside the .blend files, which we do not want happening in
+      # the source tree.
+      - name: Stage library
+        run: |
+          mkdir -p "$SITE_DIR"
+          cp -R "$LIBRARY_DIR"/. "$SITE_DIR"/
+
+      # A newly created repository publishes correctly with nothing edited: the
+      # library name and contact shown in Blender's Preferences are synthesised
+      # from the repository itself, and so are the URLs on the landing page.
+      # Whatever $LIBRARY_DIR/_asset-library-meta.json already sets is kept, so
+      # personalizing later means adding only the keys you care about. The
+      # listing generator preserves both blocks and only fills in api_versions.
+      - name: Derive library metadata and site variables
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          site = Path(os.environ["SITE_DIR"])
+          owner, repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+
+          meta_path = site / "_asset-library-meta.json"
+          meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+          meta.setdefault("api_versions", {})
+          meta.setdefault("name", repo.replace("-", " ").replace("_", " ").title())
+          contact = meta.setdefault("contact", {})
+          contact.setdefault("name", owner)
+          contact.setdefault("url", f"https://github.com/{owner}/{repo}")
+          meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+          # A repository literally named <owner>.github.io is served from the
+          # domain root instead of a /<repo>/ subpath.
+          host = f"{owner.lower()}.github.io"
+          pages_url = f"https://{host}/" if repo.lower() == host else f"https://{host}/{repo}/"
+
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"SITE_TITLE={meta['name']}\n")
+              env.write(f"PAGES_URL={pages_url}\n")
+              env.write(f"REPO_SLUG={owner}/{repo}\n")
+              env.write(f"REPO_URL=https://github.com/{owner}/{repo}\n")
+          PY
+
+      # The heredoc is quoted, so nothing inside the page is expanded by the
+      # shell. GitHub still expands ${{ }} in a run block, so do not add any.
+      # Per-repo values (title, URLs, version) are placeholder tokens here,
+      # filled in by the Python substitution below the heredoc instead — that
+      # keeps this block free of any interpolation, shell- or GitHub-side.
+      - name: Write landing page
+        run: |
+          cat > "$SITE_DIR/index.html" <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>__SITE_TITLE__</title>
+          <meta name="description" content="A remote asset library for Blender __BLENDER_VERSION__+.">
+          <style>
+            :root {
+              --bg: #fbfbfa;
+              --panel: #ffffff;
+              --border: #e2e0dc;
+              --text: #1c1b19;
+              --muted: #6b6862;
+              --accent: #d9700a;
+              --code-bg: #f2f0ed;
+              --shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px -12px rgba(0,0,0,.15);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root {
+                --bg: #17161a;
+                --panel: #201f24;
+                --border: #33313a;
+                --text: #ecebe9;
+                --muted: #9d9aa3;
+                --accent: #ff9a3c;
+                --code-bg: #2a2830;
+                --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.6);
+              }
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              padding: 3rem 1.25rem 4rem;
+              background: var(--bg);
+              color: var(--text);
+              font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+              -webkit-font-smoothing: antialiased;
+            }
+            main { max-width: 40rem; margin: 0 auto; }
+            h1 { font-size: 1.65rem; line-height: 1.2; margin: 0 0 .35rem; letter-spacing: -.02em; }
+            .tagline { color: var(--muted); margin: 0 0 2.25rem; }
+            h2 {
+              font-size: .75rem; text-transform: uppercase; letter-spacing: .08em;
+              color: var(--muted); margin: 2.5rem 0 .85rem; font-weight: 600;
+            }
+
+            .urlbar {
+              display: flex; gap: .5rem; align-items: stretch;
+              background: var(--panel); border: 1px solid var(--border);
+              border-radius: 10px; padding: .5rem; box-shadow: var(--shadow);
+            }
+            .urlbar code {
+              flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
+              padding: .5rem .6rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: .875rem; color: var(--text);
+            }
+            button {
+              flex: none; border: 1px solid var(--border); background: var(--code-bg);
+              color: var(--text); border-radius: 7px; padding: .5rem .9rem;
+              font: inherit; font-size: .85rem; font-weight: 500; cursor: pointer;
+            }
+            button:hover { border-color: var(--accent); color: var(--accent); }
+
+            ol { padding-left: 1.15rem; margin: 0; }
+            li { margin-bottom: .6rem; }
+            li:last-child { margin-bottom: 0; }
+            kbd {
+              background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+              padding: .08em .4em; font: inherit; font-size: .85em; white-space: nowrap;
+            }
+
+            .note {
+              border-left: 2px solid var(--accent); padding: .1rem 0 .1rem .9rem;
+              color: var(--muted); font-size: .9rem; margin-top: 1.5rem;
+            }
+
+            #assets { display: grid; gap: .85rem; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); }
+            .card {
+              background: var(--panel); border: 1px solid var(--border);
+              border-radius: 10px; padding: .6rem; text-align: center;
+            }
+            .card img {
+              width: 100%; aspect-ratio: 1; object-fit: contain;
+              border-radius: 6px; background: var(--code-bg); display: block;
+            }
+            .card .nm { font-size: .82rem; margin-top: .5rem; word-break: break-word; }
+            .card .ct { font-size: .72rem; color: var(--muted); }
+
+            footer {
+              margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border);
+              color: var(--muted); font-size: .875rem;
+            }
+            a { color: var(--accent); }
+          </style>
+          </head>
+          <body>
+          <main>
+            <h1>__SITE_TITLE__</h1>
+            <p class="tagline">A remote asset library for Blender&nbsp;__BLENDER_VERSION__ and newer.</p>
+
+            <h2>Library URL</h2>
+            <div class="urlbar">
+              <code id="url">__PAGES_URL__</code>
+              <button id="copy" type="button">Copy</button>
+            </div>
+
+            <h2>Adding it to Blender</h2>
+            <ol>
+              <li>Open <kbd>Edit ▸ Preferences</kbd>.</li>
+              <li>Under <kbd>System ▸ Network</kbd>, turn on <kbd>Allow Online Access</kbd>.</li>
+              <li>Go to <kbd>Asset Libraries</kbd>, press <kbd>+</kbd> and choose
+                  <kbd>Add Remote Asset Library</kbd>.</li>
+              <li>Paste the URL above into the <kbd>URL</kbd> field.</li>
+            </ol>
+            <p class="note">
+              The assets now appear in the Asset Browser and Asset Shelf, and download on
+              demand — right-click an asset and choose <em>Download Asset</em>. Online
+              libraries cannot be linked, so the import method is Append or Pack.
+            </p>
+            <p class="note">
+              <strong>Not seeing a newly published asset?</strong> Blender caches the
+              listing. Select this library in the Asset Browser and use
+              <kbd>Library &#9656; Refresh Remote Listing</kbd> — the refresh button next
+              to the library dropdown only re-reads the local cache and does not
+              re-download anything.
+            </p>
+
+            <section id="listing" hidden>
+              <h2>In this library</h2>
+              <div id="assets"></div>
+            </section>
+
+            <footer>
+              Built with Blender __BLENDER_VERSION__ from
+              <a href="__REPO_URL__">__REPO_SLUG__</a>.
+            </footer>
+          </main>
+
+          <script>
+            // __PAGES_URL__ is derived from the repository at build time, which is
+            // right for a stock user.github.io/repo/ deployment but wrong behind a
+            // custom domain or after a rename. The page is served from the library
+            // root, so the address bar is the authoritative answer — use it.
+            document.getElementById("url").textContent =
+              location.href.split(/[?#]/)[0].replace(/index\.html$/, "");
+
+            const btn = document.getElementById("copy");
+            btn.addEventListener("click", async () => {
+              try {
+                await navigator.clipboard.writeText(document.getElementById("url").textContent.trim());
+                btn.textContent = "Copied";
+                setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+              } catch {
+                btn.textContent = "Copy failed";
+                setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+              }
+            });
+
+            // Progressive enhancement: list the assets straight from the generated
+            // listing, so this page never goes stale. Silently skipped if it fails.
+            (async () => {
+              try {
+                // GitHub Pages serves these with max-age=600, so the index is
+                // revalidated explicitly — otherwise a freshly published asset
+                // stays invisible here for ten minutes. Everything the index
+                // points at is then fetched with its hash in the query string,
+                // which is exactly what Blender does: the URL changes whenever
+                // the content does, so those can be cached hard and still never
+                // go stale.
+                const bust = (url, hash) => url + (hash ? "?hash=" + encodeURIComponent(hash) : "");
+                const index = await (await fetch("_v1/asset-index.json", { cache: "no-cache" })).json();
+                const catalogs = new Map((index.catalogs || []).flatMap(c => (c.uuids || []).map(u => [u, c.path])));
+                const pages = await Promise.all(
+                  (index.pages || []).map(p => fetch(bust(p.url, p.hash)).then(r => r.json()))
+                );
+                const assets = pages.flatMap(p => p.assets || []);
+                if (!assets.length) return;
+
+                const grid = document.getElementById("assets");
+                for (const asset of assets) {
+                  const card = document.createElement("div");
+                  card.className = "card";
+                  if (asset.thumbnail) {
+                    const img = document.createElement("img");
+                    img.src = bust(asset.thumbnail.url, asset.thumbnail.hash);
+                    img.alt = "";
+                    img.loading = "lazy";
+                    card.append(img);
+                  }
+                  const nm = document.createElement("div");
+                  nm.className = "nm";
+                  nm.textContent = asset.name;
+                  card.append(nm);
+                  const catalog = catalogs.get(asset.meta && asset.meta.catalog_id);
+                  if (catalog) {
+                    const ct = document.createElement("div");
+                    ct.className = "ct";
+                    ct.textContent = catalog;
+                    card.append(ct);
+                  }
+                  grid.append(card);
+                }
+                document.getElementById("listing").hidden = false;
+              } catch {
+                /* listing unavailable — the instructions above still stand */
+              }
+            })();
+          </script>
+          </body>
+          </html>
+          HTML
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["SITE_DIR"]) / "index.html"
+          text = path.read_text()
+          for token in ("SITE_TITLE", "BLENDER_VERSION", "PAGES_URL", "REPO_URL", "REPO_SLUG"):
+              text = text.replace(f"__{token}__", os.environ[token])
+          path.write_text(text)
+          PY
+
+      # Writes _asset-library-meta.json, _v1/asset-index.json, _v1/assets-*.json
+      # and the *_thumbnails/ WebP previews. The name & contact staged in from
+      # $LIBRARY_DIR are preserved; only the api_versions block is refreshed.
+      - name: Generate asset listing
+        run: blender -b --factory-startup -c asset_listing generate "$SITE_DIR"
+
+      # Re-hashes every referenced .blend and thumbnail, checks the index and
+      # page counts agree, and fails on an empty library or a broken reference.
+      - name: Verify asset listing
+        run: python3 .github/scripts/verify_listing.py "$SITE_DIR"
+
+      # The generator may write the metadata file without a trailing newline, so
+      # the bare `echo` is needed or the closing fence lands on the same line as
+      # the final `}` and the code block never closes.
+      - name: Show generated listing
+        run: |
+          {
+            echo '## Generated listing'
+            echo '```json'
+            cat "$SITE_DIR/_asset-library-meta.json"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload site as Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          # Dotfiles are excluded by default, which is what we want: the only
+          # one here is the generator's `*_thumbnails/.last_modified` rebuild
+          # cache, which no client ever fetches.
+          path: ${{ env.SITE_DIR }}
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    # Never cancel an in-flight deployment: a half-published library would
+    # serve a listing whose hashes no longer match the files next to it.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      # Enabling Pages is the one thing a workflow cannot do for itself: the
+      # `enablement` input of actions/configure-pages needs a token other than
+      # GITHUB_TOKEN. So when the deploy fails on a brand-new repository, say
+      # what to click instead of leaving an API error as the only clue.
+      - name: Explain how to enable Pages
+        if: failure()
+        run: |
+          {
+            echo '## Publishing failed'
+            echo
+            echo 'If the error above is about Pages not being enabled, turn it on and'
+            echo 're-run this workflow. Either set **Source** to **GitHub Actions** in'
+            echo '**Settings > Pages**, or run:'
+            echo
+            echo '```sh'
+            echo 'gh api --method POST repos/{owner}/{repo}/pages -f build_type=workflow'
+            echo '```'
+            echo
+            echo 'That setting is the only manual step this template has: enabling Pages'
+            echo 'needs a token more privileged than the one this workflow is given.'
+          } >> "$GITHUB_STEP_SUMMARY"
